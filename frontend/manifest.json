@@ -1,0 +1,21 @@
+{
+  "short_name": "IronLog",
+  "name": "IronLog Gym Management",
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": "/index.html",
+  "background_color": "#0D0D0D",
+  "display": "standalone",
+  "scope": "/",
+  "theme_color": "#FF3E3E"
+}

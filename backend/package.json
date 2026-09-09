@@ -1,0 +1,23 @@
+{
+  "name": "ironlog-backend",
+  "version": "1.0.0",
+  "description": "IRONLOG - multi-role gym coaching platform (owner / coach / member) API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.115.0",
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^13.0.3",
+    "cors": "^2.8.5",
+    "csv-parser": "^3.2.1",
+    "dotenv": "^17.4.2",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.0",
+    "nodemailer": "^10.0.0",
+    "uuid": "^9.0.1"
+  }
+}

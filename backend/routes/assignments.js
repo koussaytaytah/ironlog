@@ -1,0 +1,369 @@
+const express = require('express');
+const { v4: uuidv4 } = require('uuid');
+const { supabase } = require('../db');
+const { authRequired } = require('../middleware/auth');
+const { evaluatePRs } = require('../lib/personalRecords');
+
+const router = express.Router();
+
+const DAY_MS = 86400000;
+const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+function resolveCurrentDay(assignment, program, now = new Date()) {
+  if (!program || !Array.isArray(program.schedule) || program.schedule.length === 0) return null;
+  const startedAt = assignment.startedAt ? new Date(assignment.startedAt).getTime() : now.getTime();
+  const daysSinceStart = Math.floor((now.getTime() - startedAt) / DAY_MS);
+  if (daysSinceStart < 0) {
+    const first = program.schedule.find(s => s.weekNumber === 1 && s.exercises && s.exercises.length > 0);
+    if (!first) return { weekNumber: 1, dayNumber: 1, dayLabel: 'Day 1', isRestDay: true, scheduleIndex: 0 };
+    return { weekNumber: 1, dayNumber: first.dayNumber, dayLabel: first.label || 'Day ' + first.dayNumber, isRestDay: false, scheduleIndex: program.schedule.indexOf(first) };
+  }
+  const totalDays = program.weeks * 7;
+  if (daysSinceStart >= totalDays) {
+    const last = [...program.schedule].reverse().find(s => s.exercises && s.exercises.length > 0);
+    return { weekNumber: program.weeks, dayNumber: last ? last.dayNumber : 1, dayLabel: last ? (last.label || 'Day ' + last.dayNumber) : 'Done', isRestDay: false, scheduleIndex: last ? program.schedule.indexOf(last) : 0, finished: true };
+  }
+  const dayOfWeek = daysSinceStart % 7;
+  const targetDayNum = dayOfWeek + 1;
+  let entry = program.schedule.find(s => s.weekNumber === Math.floor(daysSinceStart / 7) + 1 && s.dayNumber === targetDayNum);
+  if (!entry) {
+    const startIdx = Math.floor(daysSinceStart / 7) * 7 + (targetDayNum - 1);
+    for (let i = startIdx; i < program.schedule.length; i++) {
+      const s = program.schedule[i];
+      if (s.exercises && s.exercises.length > 0) {
+        return { weekNumber: s.weekNumber, dayNumber: s.dayNumber, dayLabel: s.label || 'Day ' + s.dayNumber, isRestDay: false, scheduleIndex: i, ahead: i > startIdx };
+      }
+    }
+    return { weekNumber: Math.floor(daysSinceStart / 7) + 1, dayNumber: targetDayNum, dayLabel: 'Rest', isRestDay: true, scheduleIndex: -1 };
+  }
+  const isRest = !entry.exercises || entry.exercises.length === 0;
+  return { weekNumber: entry.weekNumber, dayNumber: entry.dayNumber, dayLabel: entry.label || (isRest ? 'Rest' : 'Day ' + entry.dayNumber), isRestDay: isRest, scheduleIndex: program.schedule.indexOf(entry) };
+}
+
+router.post('/', authRequired, async (req, res) => {
+  if (req.user.role !== 'trainer') return res.status(403).json({ error: 'Only coaches can assign programs' });
+  const { programId, clientId, startedAt } = req.body;
+
+  const { data: program, error: pErr } = await supabase.from('programs').select('*').eq('id', programId).single();
+  if (pErr || !program || program.trainerId !== req.user.id) return res.status(404).json({ error: 'Program not found, or not yours' });
+
+  const { data: client, error: cErr } = await supabase.from('users').select('*').eq('id', clientId).eq('role', 'client').eq('trainerId', req.user.id).single();
+  if (cErr || !client) return res.status(404).json({ error: 'That member is not one of your clients' });
+
+  const start = startedAt ? new Date(startedAt) : new Date();
+  if (isNaN(start.getTime())) return res.status(400).json({ error: 'startedAt must be a valid date' });
+
+  const assignment = {
+    id: 'asg_' + uuidv4().slice(0, 8),
+    programId, clientId, clientName: client.name,
+    assignedAt: new Date().toISOString(),
+    startedAt: start.toISOString(),
+    progress: 0,
+    completedItems: [],
+  };
+
+  const { error: aErr } = await supabase.from('assignments').insert(assignment);
+  if (aErr) return res.status(500).json({ error: aErr.message });
+
+  await supabase.from('auditLog').insert({
+    id: 'audit_' + uuidv4().slice(0, 8),
+    actorId: req.user.id, actorName: req.user.name, actorRole: req.user.role, gymId: req.user.gymId,
+    action: 'assignment.create',
+    target: JSON.stringify({ type: 'assignment', id: assignment.id, programId, clientId }),
+    meta: JSON.stringify({ programTitle: program.title }),
+    at: new Date().toISOString(),
+  });
+
+  await supabase.from('notifications').insert({
+    id: 'notif_' + uuidv4().slice(0, 8),
+    gymId: req.user.gymId, userId: clientId, kind: 'assignment',
+    title: `📋 New plan: ${program.title}`,
+    body: `Your coach assigned you a new ${program.weeks}-week program.`,
+    link: '/today',
+    read: 0, createdAt: new Date().toISOString(),
+  });
+
+  res.json({ ...assignment, program });
+});
+
+router.post('/:id/restart', authRequired, async (req, res) => {
+  const { data: a, error: aErr } = await supabase.from('assignments').select('*').eq('id', req.params.id).single();
+  if (aErr || !a) return res.status(404).json({ error: 'Not found' });
+
+  const { data: program } = await supabase.from('programs').select('*').eq('id', a.programId).single();
+  if (req.user.role !== 'trainer' || (program && program.trainerId !== req.user.id)) {
+    return res.status(403).json({ error: 'Not your assignment to restart' });
+  }
+
+  const updates = {
+    startedAt: new Date().toISOString(),
+    completedItems: [],
+    progress: 0,
+  };
+
+  const { error: upErr } = await supabase.from('assignments').update(updates).eq('id', a.id);
+  if (upErr) return res.status(500).json({ error: upErr.message });
+
+  await supabase.from('programCheckoffs').delete().eq('assignmentId', a.id);
+
+  await supabase.from('auditLog').insert({
+    id: 'audit_' + uuidv4().slice(0, 8),
+    actorId: req.user.id, actorName: req.user.name, actorRole: req.user.role, gymId: req.user.gymId,
+    action: 'assignment.restart',
+    target: JSON.stringify({ type: 'assignment', id: a.id }),
+    meta: JSON.stringify({ clientId: a.clientId, programId: a.programId }),
+    at: new Date().toISOString(),
+  });
+
+  await supabase.from('notifications').insert({
+    id: 'notif_' + uuidv4().slice(0, 8),
+    gymId: req.user.gymId, userId: a.clientId, kind: 'assignment',
+    title: `🔄 Plan restarted`,
+    body: `Your coach restarted your "${program ? program.title : 'plan'}". Day 1, fresh start.`,
+    link: '/today',
+    read: 0, createdAt: new Date().toISOString(),
+  });
+
+  res.json({ ...a, ...updates, program });
+});
+
+router.get('/mine', authRequired, async (req, res) => {
+  if (req.user.role !== 'client') return res.status(403).json({ error: 'Members only' });
+
+  const { data: assignments, error } = await supabase.from('assignments').select('*').eq('clientId', req.user.id);
+  if (error) return res.status(500).json({ error: error.message });
+
+  const result = [];
+  for (const a of assignments) {
+    const { data: program } = await supabase.from('programs').select('*').eq('id', a.programId).single();
+    result.push({ ...a, program });
+  }
+  res.json(result);
+});
+
+router.get('/for-client/:clientId', authRequired, async (req, res) => {
+  if (req.user.role !== 'trainer') return res.status(403).json({ error: 'Coaches only' });
+
+  const { data: client, error: cErr } = await supabase.from('users').select('*').eq('id', req.params.clientId).single();
+  if (cErr || !client || client.trainerId !== req.user.id) return res.status(403).json({ error: 'Not your client' });
+
+  const { data: assignments, error: aErr } = await supabase.from('assignments').select('*').eq('clientId', req.params.clientId);
+  if (aErr) return res.status(500).json({ error: aErr.message });
+
+  const result = [];
+  for (const a of assignments) {
+    const { data: program } = await supabase.from('programs').select('*').eq('id', a.programId).single();
+    result.push({ ...a, program });
+  }
+  res.json(result);
+});
+
+router.get('/today', authRequired, async (req, res) => {
+  if (req.user.role !== 'client') return res.status(403).json({ error: 'Members only' });
+
+  const { data: mine, error } = await supabase.from('assignments').select('*').eq('clientId', req.user.id);
+  if (error) return res.status(500).json({ error: error.message });
+
+  const now = new Date();
+  const result = [];
+
+  for (const a of mine) {
+    const { data: program } = await supabase.from('programs').select('*').eq('id', a.programId).single();
+    const dayInfo = resolveCurrentDay(a, program, now);
+    let exercises = [];
+    let weekTotal = 0, weekDone = 0, allTotal = 0;
+
+    if (program && Array.isArray(program.schedule)) {
+      for (const s of program.schedule) {
+        if (s.exercises) allTotal += s.exercises.length;
+      }
+      if (dayInfo) {
+        const currentWeekEntries = program.schedule.filter(s => s.weekNumber === dayInfo.weekNumber);
+        for (const s of currentWeekEntries) if (s.exercises) weekTotal += s.exercises.length;
+      }
+      const { data: myCheckoffs } = await supabase.from('programCheckoffs').select('*').eq('assignmentId', a.id);
+
+      if (dayInfo && !dayInfo.isRestDay && dayInfo.scheduleIndex >= 0) {
+        const entry = program.schedule[dayInfo.scheduleIndex];
+        exercises = (entry.exercises || []).map(ex => {
+          const done = myCheckoffs?.some(c => c.weekNumber === dayInfo.weekNumber && c.dayNumber === dayInfo.dayNumber && c.exerciseId === ex.exerciseId);
+          if (done) weekDone++;
+          return { ...ex, completed: done };
+        });
+      } else if (dayInfo) {
+        weekDone = myCheckoffs?.filter(c => c.weekNumber === dayInfo.weekNumber).length || 0;
+      }
+    } else if (program && Array.isArray(program.items)) {
+      const completedNames = new Set(a.completedItems || []);
+      exercises = program.items.map((it, i) => {
+        const done = completedNames.has(it.name) || completedNames.has(String(i));
+        if (done) weekDone++;
+        return { name: it.name, detail: it.detail, completed: done };
+      });
+      weekTotal = program.items.length;
+      allTotal = program.items.length;
+    }
+
+    const weekProgress = weekTotal ? Math.round((weekDone / weekTotal) * 100) : 0;
+    const { data: totalCheckoffs, count: totalCount } = await supabase.from('programCheckoffs').select('id', { count: 'exact' }).eq('assignmentId', a.id);
+    const totalProgress = allTotal ? Math.round((totalCount || 0) / allTotal * 100) : 0;
+
+    result.push({
+      assignmentId: a.id,
+      programId: a.programId,
+      programTitle: program ? program.title : '(deleted)',
+      type: program ? program.type : 'workout',
+      startedAt: a.startedAt,
+      weekNumber: dayInfo ? dayInfo.weekNumber : 1,
+      dayNumber: dayInfo ? dayInfo.dayNumber : 1,
+      dayLabel: dayInfo ? dayInfo.dayLabel : '—',
+      isRestDay: dayInfo ? !!dayInfo.isRestDay : false,
+      finished: dayInfo ? !!dayInfo.finished : false,
+      ahead: dayInfo ? !!dayInfo.ahead : false,
+      exercises,
+      weekProgress,
+      totalProgress,
+    });
+  }
+
+  res.json({
+    todayISO: now.toISOString(),
+    weekday: DAY_LABELS[(now.getDay() + 6) % 7],
+    assignments: result,
+  });
+});
+
+router.patch('/:id/progress', authRequired, async (req, res) => {
+  if (req.user.role !== 'client') return res.status(403).json({ error: 'Members only' });
+
+  const { data: a, error: aErr } = await supabase.from('assignments').select('*').eq('id', req.params.id).eq('clientId', req.user.id).single();
+  if (aErr || !a) return res.status(404).json({ error: 'Not found' });
+
+  let weekNumber, dayNumber, exerciseId, completed, weight, reps;
+  if (req.body && req.body.exerciseCheckoff) {
+    ({ weekNumber, dayNumber, exerciseId, completed, weight, reps } = req.body.exerciseCheckoff);
+  } else {
+    ({ weekNumber, dayNumber, exerciseId, completed, weight, reps } = req.body || {});
+  }
+  if (typeof weekNumber !== 'number' || typeof dayNumber !== 'number' || !exerciseId || typeof completed !== 'boolean') {
+    return res.status(400).json({ error: 'weekNumber, dayNumber, exerciseId, completed (bool) are required' });
+  }
+
+  const { data: program } = await supabase.from('programs').select('*').eq('id', a.programId).single();
+  const newPRs = [];
+
+  if (completed && (typeof weight === 'number' || typeof reps === 'number')) {
+    let exerciseName = exerciseId;
+    if (program && Array.isArray(program.schedule)) {
+      const day = program.schedule.find(s => s.weekNumber === weekNumber && s.dayNumber === dayNumber);
+      const ex = day && (day.exercises || []).find(e => e.exerciseId === exerciseId);
+      if (ex) exerciseName = ex.name;
+    }
+    const { data: member } = await supabase.from('users').select('*').eq('id', a.clientId).single();
+    if (member) {
+      const result = await evaluatePRs(supabase, member, {
+        exerciseId,
+        exerciseName,
+        weight: typeof weight === 'number' ? weight : null,
+        reps: typeof reps === 'number' ? reps : null,
+      });
+      newPRs.push(...result);
+    }
+  }
+
+  await supabase.from('programCheckoffs').delete().eq('assignmentId', a.id).eq('weekNumber', weekNumber).eq('dayNumber', dayNumber).eq('exerciseId', exerciseId);
+
+  if (completed) {
+    await supabase.from('programCheckoffs').insert({
+      id: 'pc_' + uuidv4().slice(0, 8),
+      assignmentId: a.id,
+      weekNumber, dayNumber, exerciseId,
+      completedAt: new Date().toISOString(),
+    });
+  }
+
+  let totalExercises = 0;
+  if (program && Array.isArray(program.schedule)) {
+    for (const s of program.schedule) if (s.exercises) totalExercises += s.exercises.length;
+  } else if (program && Array.isArray(program.items)) {
+    totalExercises = program.items.length;
+  }
+
+  const { count: doneCount } = await supabase.from('programCheckoffs').select('id', { count: 'exact' }).eq('assignmentId', a.id);
+  const progress = totalExercises ? Math.round((doneCount / totalExercises) * 100) : 0;
+
+  const { data: updatedA, error: upErr } = await supabase.from('assignments').update({ progress }).eq('id', a.id).select().single();
+  if (upErr) return res.status(500).json({ error: upErr.message });
+
+  res.json({ ...updatedA, program, newPRs });
+});
+
+router.get('/completion', authRequired, async (req, res) => {
+  if (req.user.role !== 'trainer') return res.status(403).json({ error: 'Coaches only' });
+
+  const { data: myClients } = await supabase.from('users').select('*').eq('role', 'client').eq('trainerId', req.user.id);
+  const now = new Date();
+  const monday = new Date(now);
+  monday.setHours(0, 0, 0, 0);
+  const dayOfWeek = (monday.getDay() + 6) % 7;
+  monday.setDate(monday.getDate() - dayOfWeek);
+  const weekStartISO = monday.toISOString();
+
+  const rows = [];
+  for (const client of myClients) {
+    const { data: assignments } = await supabase.from('assignments').select('*').eq('clientId', client.id);
+    for (const a of assignments) {
+      const { data: program } = await supabase.from('programs').select('*').eq('id', a.programId).single();
+      if (!program) continue;
+      if (!Array.isArray(program.schedule)) {
+        const { data: checkoffs } = await supabase.from('programCheckoffs').select('*').eq('assignmentId', a.id);
+        const myCheckoffs = (checkoffs || []).length;
+        const total = (program.items || []).length;
+        rows.push({
+          clientId: client.id, clientName: client.name,
+          assignmentId: a.id, programTitle: program.title,
+          legacy: true,
+          days: [{ dayNumber: 1, dayLabel: 'Legacy', completedCount: myCheckoffs, totalCount: total, isRestDay: false }],
+          weekCompletedPct: total ? Math.round(myCheckoffs / total * 100) : 0,
+        });
+        continue;
+      }
+      const days = [];
+      const startedAt = a.startedAt ? new Date(a.startedAt).getTime() : now.getTime();
+      const weeksElapsed = Math.floor((now.getTime() - startedAt) / (DAY_MS * 7));
+      const currentWeek = Math.min(weeksElapsed + 1, program.weeks);
+      const weekEntries = program.schedule.filter(s => s.weekNumber === currentWeek);
+      const { data: myCheckoffs } = await supabase.from('programCheckoffs').select('*').eq('assignmentId', a.id).eq('weekNumber', currentWeek);
+      let weekDone = 0, weekTotal = 0;
+      for (let dayNum = 1; dayNum <= 7; dayNum++) {
+        const entry = weekEntries.find(s => s.dayNumber === dayNum);
+        if (!entry) continue;
+        const isRest = !entry.exercises || entry.exercises.length === 0;
+        const total = entry.exercises ? entry.exercises.length : 0;
+        const done = isRest ? 0 : (myCheckoffs || []).filter(c => c.dayNumber === dayNum).length;
+        weekDone += done;
+        weekTotal += total;
+        days.push({
+          dayNumber: dayNum,
+          dayLabel: entry.label || ('Day ' + dayNum),
+          completedCount: done,
+          totalCount: total,
+          isRestDay: isRest,
+          isToday: dayNum === ((now.getDay() + 6) % 7) + 1,
+        });
+      }
+      rows.push({
+        clientId: client.id, clientName: client.name,
+        assignmentId: a.id, programTitle: program.title,
+        startedAt: a.startedAt,
+        weekNumber: currentWeek,
+        days,
+        weekCompletedPct: weekTotal ? Math.round(weekDone / weekTotal * 100) : 0,
+      });
+    }
+  }
+
+  res.json({ weekStartISO, rows });
+});
+
+module.exports = router;
